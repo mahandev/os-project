@@ -1,7 +1,5 @@
 #define _GNU_SOURCE
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -9,14 +7,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
+#include <stdint.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
+
+#include "net_compat.h"
 
 #define MAX_USERNAME 32
 #define MAX_LINE 2048
 
-static int server_fd = -1;
+static socket_handle_t server_fd = NET_INVALID_SOCKET;
 static pthread_t receiver_thread;
 static volatile sig_atomic_t running = 1;
 static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -31,7 +33,40 @@ static void safe_print(const char *fmt, ...) {
     pthread_mutex_unlock(&stdout_lock);
 }
 
-static ssize_t read_line(int fd, char *buffer, size_t max_len) {
+static ssize_t portable_getline(char **lineptr, size_t *n, FILE *stream) {
+#ifdef _WIN32
+    if (!lineptr || !n || !stream) {
+        return -1;
+    }
+    if (*lineptr == NULL || *n == 0) {
+        *n = 256;
+        *lineptr = malloc(*n);
+        if (*lineptr == NULL) {
+            return -1;
+        }
+    }
+    size_t total = 0;
+    while (fgets(*lineptr + total, (int)(*n - total), stream)) {
+        size_t chunk = strlen(*lineptr + total);
+        total += chunk;
+        if (total > 0 && (*lineptr)[total - 1] == '\n') {
+            return (ssize_t)total;
+        }
+        size_t new_size = (*n) * 2;
+        char *tmp = realloc(*lineptr, new_size);
+        if (!tmp) {
+            return -1;
+        }
+        *lineptr = tmp;
+        *n = new_size;
+    }
+    return (total > 0) ? (ssize_t)total : -1;
+#else
+    return getline(lineptr, n, stream);
+#endif
+}
+
+static ssize_t read_line(socket_handle_t fd, char *buffer, size_t max_len) {
     size_t offset = 0;
     while (offset < max_len - 1) {
         char c;
@@ -127,16 +162,16 @@ static void *receiver(void *arg) {
 }
 
 static void cleanup(void) {
-    if (server_fd != -1) {
-        close(server_fd);
-        server_fd = -1;
+    if (server_fd != NET_INVALID_SOCKET) {
+        net_close(server_fd);
+        server_fd = NET_INVALID_SOCKET;
     }
 }
 
 static void handle_sigint(int signum) {
     (void)signum;
     running = 0;
-    if (server_fd != -1) {
+    if (server_fd != NET_INVALID_SOCKET) {
         shutdown(server_fd, SHUT_RDWR);
     }
 }
@@ -158,14 +193,24 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    if (net_init() != 0) {
+        fprintf(stderr, "Failed to initialize networking\n");
+        return EXIT_FAILURE;
+    }
+
+    #ifndef _WIN32
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_sigint;
     sigaction(SIGINT, &sa, NULL);
+#else
+    signal(SIGINT, handle_sigint);
+#endif
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
+    if (server_fd == NET_INVALID_SOCKET) {
         perror("socket");
+        net_cleanup();
         return EXIT_FAILURE;
     }
 
@@ -175,12 +220,14 @@ int main(int argc, char **argv) {
     if (inet_pton(AF_INET, server_ip, &addr.sin_addr) != 1) {
         fprintf(stderr, "Invalid server IP\n");
         cleanup();
+        net_cleanup();
         return EXIT_FAILURE;
     }
 
-    if (connect(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    if (connect(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == NET_SOCKET_ERROR) {
         perror("connect");
         cleanup();
+        net_cleanup();
         return EXIT_FAILURE;
     }
 
@@ -188,6 +235,7 @@ int main(int argc, char **argv) {
     if (read_line(server_fd, line, sizeof(line)) <= 0) {
         fprintf(stderr, "Failed to read server greeting\n");
         cleanup();
+        net_cleanup();
         return EXIT_FAILURE;
     }
     printf("%s\n", line);
@@ -195,11 +243,13 @@ int main(int argc, char **argv) {
     if (read_line(server_fd, line, sizeof(line)) <= 0) {
         fprintf(stderr, "Server closed during auth\n");
         cleanup();
+        net_cleanup();
         return EXIT_FAILURE;
     }
     if (strncmp(line, "OK", 2) != 0) {
         fprintf(stderr, "Authentication failed: %s\n", line);
         cleanup();
+        net_cleanup();
         return EXIT_FAILURE;
     }
     printf("%s\n", line);
@@ -215,7 +265,7 @@ int main(int argc, char **argv) {
     while (running) {
         printf("client> ");
         fflush(stdout);
-        ssize_t read = getline(&input, &input_len, stdin);
+        ssize_t read = portable_getline(&input, &input_len, stdin);
         if (read == -1) {
             break;
         }
@@ -253,10 +303,11 @@ int main(int argc, char **argv) {
     }
     free(input);
     running = 0;
-    if (server_fd != -1) {
+    if (server_fd != NET_INVALID_SOCKET) {
         shutdown(server_fd, SHUT_RDWR);
     }
     pthread_join(receiver_thread, NULL);
     cleanup();
+    net_cleanup();
     return EXIT_SUCCESS;
 }

@@ -1,17 +1,16 @@
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sqlite3.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/types.h>
-#include <unistd.h>
+
+#include "net_compat.h"
+#include "storage.h"
 
 #define MAX_USERNAME 32
 #define MAX_MESSAGE 1024
@@ -19,7 +18,7 @@
 #define DEFAULT_DB_PATH "chat.db"
 
 typedef struct client_session {
-    int socket_fd;
+    socket_handle_t socket_fd;
     pthread_t thread;
     char username[MAX_USERNAME];
     bool authenticated;
@@ -29,10 +28,21 @@ typedef struct client_session {
 
 static client_session_t *clients_head = NULL;
 static pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
-static sqlite3 *db = NULL;
-static pthread_mutex_t db_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t server_running = 1;
-static int listener_fd = -1;
+static socket_handle_t listener_fd = NET_INVALID_SOCKET;
+
+static void send_formatted(client_session_t *session, const char *fmt, ...);
+
+typedef struct {
+    client_session_t *session;
+    bool any;
+} history_context_t;
+
+static void history_emit(const char *timestamp, const char *sender, const char *body, void *ctx) {
+    history_context_t *hist = (history_context_t *)ctx;
+    send_formatted(hist->session, "HISTORY %s %s %s", timestamp, sender, body);
+    hist->any = true;
+}
 
 static void fatal(const char *msg) {
     perror(msg);
@@ -72,115 +82,24 @@ static void broadcast_shutdown_message(void) {
 static void handle_signal(int signum) {
     (void)signum;
     server_running = 0;
-    if (listener_fd != -1) {
-        close(listener_fd);
-        listener_fd = -1;
+    if (listener_fd != NET_INVALID_SOCKET) {
+        net_close(listener_fd);
+        listener_fd = NET_INVALID_SOCKET;
     }
 }
 
 static void install_signal_handlers(void) {
+#ifdef _WIN32
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-}
-
-static int init_database(const char *path) {
-    if (sqlite3_open(path, &db) != SQLITE_OK) {
-        fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(db));
-        return -1;
-    }
-    const char *full_sql =
-        "CREATE TABLE IF NOT EXISTS messages ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "sender TEXT NOT NULL,"
-        "receiver TEXT NOT NULL,"
-        "body TEXT NOT NULL,"
-        "created_at DATETIME DEFAULT CURRENT_TIMESTAMP" ");";
-    char *err = NULL;
-    if (sqlite3_exec(db, full_sql, NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "Failed to init schema: %s\n", err);
-        sqlite3_free(err);
-        return -1;
-    }
-    return 0;
-}
-
-static int store_message(const char *sender, const char *receiver, const char *body) {
-    const char *sql = "INSERT INTO messages (sender, receiver, body) VALUES (?, ?, ?);";
-    pthread_mutex_lock(&db_lock);
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        pthread_mutex_unlock(&db_lock);
-        return -1;
-    }
-    sqlite3_bind_text(stmt, 1, sender, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, receiver, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, body, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db_lock);
-    return rc == SQLITE_DONE ? 0 : -1;
-}
-
-static void send_conversation(client_session_t *session, const char *other_user) {
-    const char *sql =
-        "SELECT sender, body, datetime(created_at) FROM messages "
-        "WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?) "
-        "ORDER BY created_at ASC";
-    pthread_mutex_lock(&db_lock);
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        pthread_mutex_unlock(&db_lock);
-        send_formatted(session, "ERROR Failed to query history: %s", sqlite3_errmsg(db));
-        return;
-    }
-    sqlite3_bind_text(stmt, 1, session->username, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, other_user, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, other_user, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, session->username, -1, SQLITE_TRANSIENT);
-
-    bool any = false;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const unsigned char *sender = sqlite3_column_text(stmt, 0);
-        const unsigned char *body = sqlite3_column_text(stmt, 1);
-        const unsigned char *ts = sqlite3_column_text(stmt, 2);
-        send_formatted(session, "HISTORY %s %s %s", ts, sender, body);
-        any = true;
-    }
-    sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db_lock);
-    if (!any) {
-        send_formatted(session, "INFO No messages with %s", other_user);
-    } else {
-        send_formatted(session, "OK History end");
-    }
-}
-
-static void delete_conversation(client_session_t *session, const char *other_user) {
-    const char *sql =
-        "DELETE FROM messages WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?)";
-    pthread_mutex_lock(&db_lock);
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        pthread_mutex_unlock(&db_lock);
-        send_formatted(session, "ERROR Failed to delete history: %s", sqlite3_errmsg(db));
-        return;
-    }
-    sqlite3_bind_text(stmt, 1, session->username, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, other_user, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, other_user, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, session->username, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db_lock);
-    if (rc == SQLITE_DONE) {
-        send_formatted(session, "OK Deleted history with %s", other_user);
-    } else {
-        send_formatted(session, "ERROR Failed to delete history");
-    }
+#endif
 }
 
 static client_session_t *find_client_by_name(const char *username) {
@@ -233,8 +152,8 @@ static void notify_user_list(client_session_t *session) {
 }
 
 static void deliver_message(const char *sender, const char *receiver, const char *body) {
-    if (store_message(sender, receiver, body) != 0) {
-        fprintf(stderr, "Failed to persist message from %s to %s\n", sender, receiver);
+    if (storage_store_message(sender, receiver, body) != 0) {
+        fprintf(stderr, "Failed to persist message from %s to %s: %s\n", sender, receiver, storage_last_error());
     }
     pthread_mutex_lock(&clients_lock);
     client_session_t *target = find_client_by_name(receiver);
@@ -244,7 +163,7 @@ static void deliver_message(const char *sender, const char *receiver, const char
     pthread_mutex_unlock(&clients_lock);
 }
 
-static ssize_t read_line(int fd, char *buffer, size_t max_len) {
+static ssize_t read_line(socket_handle_t fd, char *buffer, size_t max_len) {
     size_t offset = 0;
     while (offset < max_len - 1) {
         char c;
@@ -335,7 +254,14 @@ static void *client_worker(void *arg) {
                 send_formatted(session, "ERROR Usage: GET <user>");
                 continue;
             }
-            send_conversation(session, other);
+            history_context_t ctx = {session, false};
+            if (storage_fetch_conversation(session->username, other, history_emit, &ctx) != 0) {
+                send_formatted(session, "ERROR Failed to query history: %s", storage_last_error());
+            } else if (!ctx.any) {
+                send_formatted(session, "INFO No messages with %s", other);
+            } else {
+                send_formatted(session, "OK History end");
+            }
             continue;
         }
 
@@ -345,7 +271,11 @@ static void *client_worker(void *arg) {
                 send_formatted(session, "ERROR Usage: DELETE <user>");
                 continue;
             }
-            delete_conversation(session, other);
+            if (storage_delete_conversation(session->username, other) != 0) {
+                send_formatted(session, "ERROR Failed to delete history: %s", storage_last_error());
+            } else {
+                send_formatted(session, "OK Deleted history with %s", other);
+            }
             continue;
         }
 
@@ -362,7 +292,7 @@ static void *client_worker(void *arg) {
         send_formatted(session, "ERROR Unknown command");
     }
 
-    close(session->socket_fd);
+    net_close(session->socket_fd);
     pthread_mutex_destroy(&session->send_lock);
     if (session->authenticated) {
         printf("User %s disconnected\n", session->username);
@@ -374,11 +304,11 @@ static void *client_worker(void *arg) {
 
 static void accept_loop(uint16_t port) {
     listener_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener_fd == -1) {
+    if (listener_fd == NET_INVALID_SOCKET) {
         fatal("socket");
     }
     int opt = 1;
-    setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
@@ -394,18 +324,22 @@ static void accept_loop(uint16_t port) {
     while (server_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(listener_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd == -1) {
-            if (errno == EINTR) {
+        socket_handle_t client_fd = accept(listener_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd == NET_INVALID_SOCKET) {
+            if (net_was_interrupted()) {
                 continue;
             }
+#ifdef _WIN32
+            fprintf(stderr, "accept failed: %d\n", WSAGetLastError());
+#else
             perror("accept");
+#endif
             break;
         }
         client_session_t *session = calloc(1, sizeof(client_session_t));
         if (!session) {
             fprintf(stderr, "Out of memory\n");
-            close(client_fd);
+            net_close(client_fd);
             continue;
         }
         session->socket_fd = client_fd;
@@ -414,7 +348,7 @@ static void accept_loop(uint16_t port) {
         if (pthread_create(&session->thread, NULL, client_worker, session) != 0) {
             fprintf(stderr, "Failed to create worker thread\n");
             remove_client(session);
-            close(client_fd);
+            net_close(client_fd);
             pthread_mutex_destroy(&session->send_lock);
             free(session);
             continue;
@@ -432,27 +366,33 @@ int main(int argc, char **argv) {
     uint16_t port = (uint16_t)atoi(argv[1]);
     const char *db_path = (argc == 3) ? argv[2] : DEFAULT_DB_PATH;
 
+    if (net_init() != 0) {
+        fprintf(stderr, "Failed to initialize networking\n");
+        return EXIT_FAILURE;
+    }
+
     install_signal_handlers();
-    if (init_database(db_path) != 0) {
+    if (storage_init(db_path) != 0) {
+        fprintf(stderr, "Storage init failed: %s\n", storage_last_error());
+        net_cleanup();
         return EXIT_FAILURE;
     }
 
     accept_loop(port);
     broadcast_shutdown_message();
 
-    if (listener_fd != -1) {
-        close(listener_fd);
+    if (listener_fd != NET_INVALID_SOCKET) {
+        net_close(listener_fd);
     }
     pthread_mutex_lock(&clients_lock);
     client_session_t *cur = clients_head;
     while (cur) {
-        close(cur->socket_fd);
+        net_close(cur->socket_fd);
         cur = cur->next;
     }
     pthread_mutex_unlock(&clients_lock);
-    if (db) {
-        sqlite3_close(db);
-    }
+    storage_shutdown();
     printf("Server shutdown complete\n");
+    net_cleanup();
     return EXIT_SUCCESS;
 }

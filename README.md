@@ -30,7 +30,9 @@ Requirements: gcc/clang, pthreads, SQLite3 development headers, Python 3 (for te
 ```bash
 make            # builds bin/server and bin/client
 make clean      # removes binaries and chat.db
+make windows    # builds bin/windows/server.exe (flat-file storage) and client.exe via mingw-w64
 ```
+The cross-build uses the MinGW-w64 toolchain (`brew install mingw-w64` on macOS). The Windows server binary falls back to the flat-file persistence backend (`chat.log`) while POSIX builds continue to use SQLite.
 
 ## Running
 Start the server (choose any free port, default via `PORT` variable is 5555):
